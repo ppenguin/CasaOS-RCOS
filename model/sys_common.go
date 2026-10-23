@@ -30,6 +30,9 @@ type ServerModel struct {
 	// "external" → the host owns smb.conf (it must include smb.casa.conf),
 	// CasaOS writes only smb.casa.conf
 	SambaMainConfig string
+	// ImageManaged: the system image owns updates, packages, the OS upgrade and
+	// modules (e.g. NixOS, A/B images) → the core offers none of them
+	ImageManaged bool
 }
 
 // 服务配置

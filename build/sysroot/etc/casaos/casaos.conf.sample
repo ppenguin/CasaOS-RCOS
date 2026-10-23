@@ -21,5 +21,8 @@ UpdateVersionUrl = https://github.com/ReCasaOS/CasaOS-Install/releases/latest/do
 ; managed: CasaOS writes /etc/samba/smb.conf; external: the host owns it and
 ; includes /etc/samba/smb.casa.conf, the only file CasaOS then writes
 SambaMainConfig = managed
+; true: the system image owns updates, packages, the OS upgrade and modules;
+; the core offers none of them
+ImageManaged = false
 
 [system]

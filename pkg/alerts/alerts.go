@@ -132,6 +132,9 @@ type Hub struct {
 	releaseChecked time.Time // the last look for a newer release
 	announced      string    // the release last announced
 
+	// Read and written by watchRAID's goroutine only.
+	raidErrors map[string]uint64 // the RAID members' error counters of the previous poll, nil before the first
+
 	sending sync.WaitGroup // the sends in flight, which tests wait for
 }
 

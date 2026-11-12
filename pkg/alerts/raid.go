@@ -24,11 +24,28 @@ type raidArray struct {
 }
 
 type raidMember struct {
-	Disk  string `json:"disk"`
+	Name  string `json:"name"`
+	Disk  string `json:"disk"`  // "" when the backend has no device for it (a btrfs member gone)
 	State string `json:"state"` // active, rebuilding, spare or faulty
+	// Errors is the member's error counters summed (read, write, flush, checksum), from a
+	// LocalStorage that reports them (btrfs device stats); nil from one that does not.
+	Errors *uint64 `json:"errors"`
 }
 
+// String is the member's disk, else its name.
+func (m raidMember) String() string {
+	if m.Disk != "" {
+		return m.Disk
+	}
+	return m.Name
+}
+
+// String is the array's name and level; the name alone when the level is not known (a btrfs
+// that is not mounted).
 func (a raidArray) String() string {
+	if a.Level == "" {
+		return a.Name
+	}
 	return a.Name + " (" + strings.ToUpper(a.Level) + ")"
 }
 
@@ -61,6 +78,9 @@ func (h *Hub) pollRAID(ctx context.Context) {
 		return
 	}
 	raise, resolve := raidAlerts(arrays)
+	errors, counts := raidErrorAlerts(h.raidErrors, arrays)
+	h.raidErrors = counts
+	raise = append(raise, errors...)
 	for _, a := range resolve {
 		h.resolve(a)
 	}
@@ -79,7 +99,7 @@ func raidAlerts(arrays []raidArray) (raise, resolve []alert) {
 		var failed []string
 		for _, m := range a.Members {
 			if m.State == "faulty" {
-				failed = append(failed, m.Disk)
+				failed = append(failed, m.String())
 			}
 		}
 		switch a.State {
@@ -107,4 +127,29 @@ func raidAlerts(arrays []raidArray) (raise, resolve []alert) {
 		}
 	}
 	return raise, resolve
+}
+
+// raidErrorAlerts is the members whose error counters grew since the previous poll (previous:
+// nil before the first, which only records them). The counters are kept on the disks and never
+// go down: only what is new is told, not what a box carried for years. It returns the counters
+// of this poll.
+func raidErrorAlerts(previous map[string]uint64, arrays []raidArray) (raise []alert, counts map[string]uint64) {
+	counts = map[string]uint64{}
+	for _, a := range arrays {
+		for _, m := range a.Members {
+			if m.Errors == nil {
+				continue
+			}
+			id := a.Name + ":" + m.String()
+			counts[id] = *m.Errors
+			if before, seen := previous[id]; seen && *m.Errors > before {
+				raise = append(raise, alert{
+					key:      "raid:" + id + ":errors",
+					category: Disks,
+					sentence: fmt.Sprintf("Disk %s of RAID %s reported %d new read, write or checksum errors. Check the disk, and check the array.", m, a, *m.Errors-before),
+				})
+			}
+		}
+	}
+	return raise, counts
 }

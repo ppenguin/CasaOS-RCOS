@@ -35,10 +35,15 @@ func isLoopback(realIP string) bool {
 	return realIP == "::1" || realIP == "127.0.0.1"
 }
 
+// recoverPrefix is the way back of a cloud sign-in: its path carries the state
+// of this box, which must not reach the journal any more than a token.
+const recoverPrefix = "/v1/recover/"
+
 // skipAccessLog reports whether the Echo access-log line is dropped for a
-// request: only internal notify posts, and only from the host itself.
+// request: internal notify posts from the host itself, and the way back of a
+// cloud sign-in, which the handler logs itself without its state.
 func skipAccessLog(path, realIP string) bool {
-	return strings.HasPrefix(path, internalNotifyPrefix) && isLoopback(realIP)
+	return strings.HasPrefix(path, recoverPrefix) || strings.HasPrefix(path, internalNotifyPrefix) && isLoopback(realIP)
 }
 
 func InitV1Router() http.Handler {
@@ -64,6 +69,7 @@ func InitV1Router() http.Handler {
 	}))
 
 	e.GET("/v1/sys/version/check", v1.GetSystemCheckVersion)
+	e.GET("/v1/fleet/tunnel", v1.FleetTunnel)
 	e.GET("/v1/sys/version/current", func(ctx echo.Context) error {
 		return ctx.String(200, common.VERSION)
 	})
@@ -175,6 +181,7 @@ func InitV1Router() http.Handler {
 			v1FileGroup.POST("/trash/restore", v1.RestoreTrash)
 			v1FileGroup.DELETE("/trash", v1.DeleteTrash)
 			v1FileGroup.DELETE("/trash/all", v1.EmptyTrash)
+			v1FileGroup.GET("/roots", v1.GetFileRoots)
 		}
 		v1CloudGroup := v1Group.Group("/cloud")
 		v1CloudGroup.Use()
@@ -237,6 +244,7 @@ func InitV1Router() http.Handler {
 				v1SambaUsersGroup.GET("", v1.GetSambaUsersList)
 				v1SambaUsersGroup.POST("", v1.PostSambaUserCreate)
 				v1SambaUsersGroup.PUT("/:username/password", v1.PutSambaUserPassword)
+				v1SambaUsersGroup.PUT("/:username/shares", v1.PutSambaUserShares)
 				v1SambaUsersGroup.DELETE("/:username", v1.DeleteSambaUser)
 			}
 		}
@@ -257,6 +265,44 @@ func InitV1Router() http.Handler {
 		v1ZerotierGroup.Use()
 		{
 			v1ZerotierGroup.Any("/*url", v1.ZerotierProxy)
+		}
+
+		// The fleet: this box's role and its boxes, and the relay that forwards
+		// one of a box's own routes into its tunnel. Reads take what the group
+		// takes; everything that changes a box, or relays an action, wants the
+		// access token in the header, like POST /v1/sys/update. The tunnel
+		// itself is a WebSocket outside the group (next to version/check).
+		v1FleetGroup := v1Group.Group("/fleet")
+		v1FleetGroup.Use()
+		{
+			v1FleetGroup.GET("", v1.GetFleet)
+			v1FleetGroup.PUT("/master", v1.PutFleetMaster, headerTokenOnly)
+			v1FleetGroup.PUT("/relay", v1.PutFleetRelay, headerTokenOnly)
+			v1FleetGroup.POST("/boxes", v1.PostFleetBoxes, headerTokenOnly)
+			v1FleetGroup.PATCH("/boxes/:id", v1.PatchFleetBox)
+			v1FleetGroup.DELETE("/boxes/:id", v1.DeleteFleetBox, headerTokenOnly)
+			v1FleetGroup.POST("/boxes/:id/code", v1.PostFleetBoxCode, headerTokenOnly)
+			v1FleetGroup.GET("/backups", v1.GetFleetBackups)
+			v1FleetGroup.GET("/boxes/:id/relay/*", v1.FleetRelay)
+			v1FleetGroup.Match([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, "/boxes/:id/relay/*", v1.FleetRelay, headerTokenOnly)
+			v1FleetGroup.PUT("/remote", v1.PutFleetRemote, headerTokenOnly)
+			v1FleetGroup.GET("/remote", v1.GetFleetRemote)
+			v1FleetGroup.POST("/remote/devices", v1.PostFleetRemoteDevice, headerTokenOnly)
+			v1FleetGroup.DELETE("/remote/devices/:id", v1.DeleteFleetRemoteDevice, headerTokenOnly)
+			v1FleetGroup.PUT("/member", v1.PutFleetMember, headerTokenOnly)
+			v1FleetGroup.DELETE("/member", v1.DeleteFleetMember, headerTokenOnly)
+		}
+
+		// Public sharing: the box's name at its relay and the apps published under it. Reads take what the group
+		// takes; everything that changes the sharing wants the access token in the header, like the fleet's.
+		v1ShareGroup := v1Group.Group("/share")
+		v1ShareGroup.Use()
+		{
+			v1ShareGroup.GET("", v1.GetShare)
+			v1ShareGroup.PUT("/name", v1.PutShareName, headerTokenOnly)
+			v1ShareGroup.PUT("/apps/:name", v1.PutShareApp, headerTokenOnly)
+			v1ShareGroup.DELETE("/apps/:name", v1.DeleteShareApp, headerTokenOnly)
+			v1ShareGroup.DELETE("/apps", v1.DeleteShareApps, headerTokenOnly)
 		}
 	}
 

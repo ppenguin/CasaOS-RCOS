@@ -34,12 +34,16 @@ import (
 	"github.com/ReCasaOS/CasaOS/pkg/cache"
 	"github.com/ReCasaOS/CasaOS/pkg/config"
 	"github.com/ReCasaOS/CasaOS/pkg/fileroots"
+	"github.com/ReCasaOS/CasaOS/pkg/fleet"
 	"github.com/ReCasaOS/CasaOS/pkg/hoststats"
 	"github.com/ReCasaOS/CasaOS/pkg/modulecmd"
+	"github.com/ReCasaOS/CasaOS/pkg/share"
 	"github.com/ReCasaOS/CasaOS/pkg/sqlite"
 	"github.com/ReCasaOS/CasaOS/pkg/telemetry"
 	"github.com/ReCasaOS/CasaOS/pkg/trash"
 	"github.com/ReCasaOS/CasaOS/pkg/utils/file"
+	"github.com/ReCasaOS/CasaOS/pkg/utils/httper"
+	"github.com/ReCasaOS/CasaOS/pkg/utils/version"
 	"github.com/ReCasaOS/CasaOS/route"
 	"github.com/ReCasaOS/CasaOS/service"
 	"github.com/coreos/go-systemd/daemon"
@@ -87,6 +91,7 @@ func init() {
 	println("build date:", date)
 
 	config.InitSetup(*configFlag, _confSample)
+	httper.UseRcloneSocketFromEnv()
 
 	logger.LogInit(config.AppInfo.LogPath, config.AppInfo.LogSaveName, config.AppInfo.LogFileExt)
 	if len(*dbFlag) == 0 {
@@ -110,9 +115,12 @@ func init() {
 	}
 
 	sqliteDB = sqlite.GetDb(*dbFlag)
-	// gredis.GetRedisConn(config.RedisInfo),
 
 	service.MyService = service.NewService(sqliteDB, config.CommonInfo.RuntimePath)
+
+	if err := service.MyService.Shares().MergeDuplicateShares(); err != nil {
+		logger.Error("failed to merge duplicate shares", zap.Error(err))
+	}
 
 	service.Cache = cache.Init()
 
@@ -177,6 +185,7 @@ func main() {
 	// hear from automatic updates how each attempt ended: set before those
 	// settle the attempt that restarted the core.
 	alerts.Default.Address = dashboardAddress
+	alerts.Default.MasterLink = fleet.Default.MemberLink
 	// image-managed: no release to look up, no OS support to report (the image owns both)
 	if !config.ServerInfo.ImageManaged {
 		alerts.Default.Latest = func() string { return service.MyService.Casa().GetCasaosVersion().Version }
@@ -205,12 +214,55 @@ func main() {
 	if !config.ServerInfo.ImageManaged {
 		alerts.Default.OSSupport = service.MyService.System().GetSystemOS
 	}
+	// Public sharing hears the apps come and go (an uninstalled app is unshared): set before Run, the bus reads it unguarded.
+	alerts.Default.OnAppEvent = share.Default.OnAppEvent
 	go alerts.Default.Run(context.Background())
+	// The fleet: this box can be the master of the owner's other boxes, or a member of one. A member executes what its
+	// master relays through this box's own gateway, with the identity of the box's services; a master raises one alert
+	// when a box has been gone ten minutes. Set before Run, which dials at once when member.json exists. Image-managed
+	// boxes take part too: what they refuse (an update of the release), they refuse through their own routes.
+	fleet.Default.RuntimePath = func() string { return config.CommonInfo.RuntimePath }
+	fleet.Default.Version = version.CurrentVersion
+	fleet.Default.Offline = alerts.Default.FleetOffline
+	fleet.Default.BackupProblem = alerts.Default.FleetBackupProblem
+	fleet.Default.Notifies = func() bool { return alerts.Default.Delivers(alerts.Fleet) }
+	fleet.Default.Net = fleet.NewTailscale(nil) // tailscaled stays stopped until the box joins a relay's fleet
+	// Public sharing goes through the relay the fleet knows, signed with the fleet's box key. A box leaving its relay
+	// forgets its sharing first, while it can still sign the call that frees its name. The adapters take no fleet lock
+	// but ShareRelay's own: Reset runs from OnLeavingRelay, with the fleet's relay mutex held.
+	share.Default.RuntimePath = func() string { return config.CommonInfo.RuntimePath }
+	share.Default.RelayURL = fleet.Default.ShareRelay
+	share.Default.BoxKey = fleet.Default.BoxKey
+	share.Default.Relay.Signed = func(ctx context.Context, method, path string, body []byte) (int, []byte, time.Duration, error) {
+		relay, ok := fleet.Default.ShareRelay()
+		if !ok {
+			return 0, nil, 0, share.ErrNoRelay
+		}
+		return fleet.Default.RelayAPI.Signed(ctx, relay, method, path, body)
+	}
+	share.Default.Relay.RegisterSelf = func(ctx context.Context) error {
+		if _, ok := fleet.Default.ShareRelay(); !ok {
+			return share.ErrNoRelay
+		}
+		err := fleet.Default.RegisterOwnBoxKey(ctx)
+		if errors.Is(err, fleet.ErrNotFleetOwner) {
+			return share.ErrWaitMaster
+		}
+		return err
+	}
+	fleet.Default.OnLeavingRelay = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		share.Default.Reset(ctx)
+	}
+	go fleet.Default.Run(context.Background())
+	go share.Default.Run(context.Background())
 	// Automatic updates start the button's own update, read the button's own
 	// version.json, and settle an update that restarted the core before checking.
 	autoupdate.Default.Releases = service.MyService.Casa()
+	autoupdate.Default.Settled = service.SettledCasaosVersion
 	autoupdate.Default.Start = func(release string) error {
-		err := service.MyService.System().UpdateSystemVersion(release)
+		err := service.MyService.System().UpdateSystemRelease(release)
 		if errors.Is(err, service.ErrSystemMaintenanceBusy) {
 			return fmt.Errorf("%w: %v", autoupdate.ErrBusy, err)
 		}
@@ -287,6 +339,8 @@ func main() {
 		"/v1/recover",
 		"/v1/other",
 		"/v1/zt",
+		"/v1/fleet",
+		"/v1/share",
 		"/v1/test",
 		route.V2APIPath,
 		route.V2DocPath,
@@ -403,7 +457,7 @@ var stopHostStats atomic.Pointer[func()]
 // /v1/sys/utilization, the storages the dashboard lists, the alerts and the message bus.
 func hostStatsConfig() hoststats.Config {
 	return hoststats.Config{
-		Dir:   "/var/lib/casaos/stats/core",
+		Dir:   hoststats.DirForDBPath(config.AppInfo.DBPath),
 		Clock: stats.SystemClock{},
 		Source: &hoststats.SystemSource{
 			Interfaces: func() []string { return service.MyService.System().GetNet(true) },

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
 	"slices"
@@ -21,14 +22,30 @@ import (
 // them.
 type HopSpec struct {
 	ID osreadiness.HopID
+	// Distro is the distribution of both releases, as the texts of the blocks name it ("Debian", "Ubuntu").
+	Distro string
 	// From and To are the codenames of the releases ("bullseye", "bookworm").
 	From, To string
+	// FromVersion and ToVersion are the numbers of the releases ("11", "12"), which the texts of the blocks name them by.
+	FromVersion, ToVersion string
 	// Later are the codenames of the releases after To: a source that names one is already past the target.
 	Later []string
 	// Firmware says that the target has the component non-free-firmware, which is put beside non-free.
 	Firmware bool
+	// Deb822 says that the plan reads the .sources files (deb822) of the box: without it, a box that has one is refused.
+	Deb822 bool
+	// SimBroken are the packages whose "E: Conf Broken" ends apt's simulation of the full upgrade (status 100) when the real upgrade goes through: the order that apt's simulator
+	// takes for them is not the one dpkg takes. Each was seen both ways, simulated and run, on the release that is left (withoutSimBroken, and sim_ok in the texts).
+	SimBroken []string
+	// OneStep says that block 5 runs the whole upgrade (dist-upgrade) and not a minimal one first, as do-release-upgrade does: a minimal upgrade leaves the init system of the release
+	// that is left under packages of the next one (firstStep).
+	OneStep bool
+	// RequiredRenames are the packages of priority required that the hop removes, each with the package that takes its place in the same upgrade ("" when none does). The
+	// plan and the guard of the blocks let such a removal through only so: when the one that takes its place is not installed, it stops as the removal of any other
+	// required package does (requiredRenamed, renameCases).
+	RequiredRenames map[string]string
 	// Refresh says that the sources are written for bringing the release that is left up to its last state, and not for the next one: the lines of that release are kept as they are
-	// (its suite, its host, its components, its backports), and what is not Debian's is put aside as it is for a hop. Only ForRefresh sets it.
+	// (its suite, its host, its components, its backports), and what is not the distribution's is put aside as it is for a hop. Only ForRefresh sets it.
 	Refresh bool
 }
 
@@ -39,10 +56,92 @@ func (h HopSpec) ForRefresh() HopSpec {
 	return h
 }
 
-// planHops is the one table of the hops a plan can be made for. Debian 12 to 13 (deb822, non-free-firmware, new clues) and
-// Ubuntu are later rungs: every other hop is hop_not_planned.
+// FromName and ToName are the releases as the texts of the blocks say them: "Debian 11", "Ubuntu 24.04".
+func (h HopSpec) FromName() string { return h.Distro + " " + h.FromVersion }
+func (h HopSpec) ToName() string   { return h.Distro + " " + h.ToVersion }
+
+// planHops is the one table of the hops a plan can be made for: every other hop is hop_not_planned.
+// The hop from Debian 12 reads the .sources files (Deb822): the images of Debian 12 and Docker's own install page write them. It
+// keeps Firmware: a box that came from Debian 11 may have non-free without non-free-firmware. The hop from Debian 11 does not
+// read them, and is what was measured.
 var planHops = []HopSpec{
-	{ID: osreadiness.HopDebian11to12, From: "bullseye", To: "bookworm", Later: []string{"trixie", "forky"}, Firmware: true},
+	{ID: osreadiness.HopDebian11to12, Distro: "Debian", From: "bullseye", To: "bookworm", FromVersion: "11", ToVersion: "12", Later: []string{"trixie", "forky"}, Firmware: true},
+	{ID: osreadiness.HopDebian12to13, Distro: "Debian", From: "bookworm", To: "trixie", FromVersion: "12", ToVersion: "13", Later: []string{"forky", "duke"}, Firmware: true, Deb822: true},
+	// the codenames after 26.04 are distro-info-data's (2026.10.12): 26.10 stonking, 27.04 tenacious. The move of coreutils to rust-coreutils ends apt's simulation of the full
+	// upgrade on coreutils-from-uutils, and the move of sudo to sudo-rs on sudo-common (a box that has sudo: every cloud image), before the minimal upgrade and after it, and the
+	// real upgrade goes through (the image ubuntu:24.04, apt 2.8.3, 2026-11-08: testdata/real/docker-u24-26-*; sudo-common was found by the QEMU proof on the cloud image).
+	{ID: osreadiness.HopUbuntu2404to2604, Distro: "Ubuntu", From: "noble", To: "resolute", FromVersion: "24.04", ToVersion: "26.04", Later: []string{"stonking", "tenacious"}, Deb822: true,
+		SimBroken: []string{"coreutils-from-uutils", "sudo-common"}, OneStep: true},
+	// the releases after 24.04 are 24.10 oracular, 25.04 plucky, 25.10 questing and 26.04 resolute. apt's simulation of the full upgrade goes through (the image ubuntu:22.04,
+	// apt 2.4.14, 2026-11-08: testdata/real/docker-u22-24-*); the hop runs in one step, as do-release-upgrade does, as the one to 26.04 learnt to.
+	// The cloud image of 22.04 records the priority of the archive for the libraries that noble renames for the 64-bit time_t, and for usrmerge: required, where the image
+	// ubuntu:22.04 says optional (the QEMU proof of the cloud image, 2026-11-09: the plan was blocked on them, and apt's own simulation, on the guest, warns of nothing).
+	// usrmerge has no successor: noble's /usr is merged, which merged_usr checks before any hop.
+	{ID: osreadiness.HopUbuntu2204to2404, Distro: "Ubuntu", From: "jammy", To: "noble", FromVersion: "22.04", ToVersion: "24.04", Later: []string{"oracular", "plucky", "questing", "resolute"},
+		Deb822: true, OneStep: true, RequiredRenames: map[string]string{
+			"libdb5.3": "libdb5.3t64", "libext2fs2": "libext2fs2t64", "libssl3": "libssl3t64", "libtirpc3": "libtirpc3t64", "usrmerge": "",
+		}},
+}
+
+// firstStep is the verb of apt that block 5 runs, and block 4 downloads for. Debian's release notes say a minimal upgrade first; Canonical's do-release-upgrade runs the whole one.
+// On Ubuntu the minimal one upgrades tcpdump of 26.04, whose sysusers.d file has the modifier "u!", while systemd 255 of 24.04 is still there: its systemd-sysusers refuses it,
+// the configuration of tcpdump fails and the block stops (the QEMU proof of the cloud image, 2026-11-08; reproduced in the image ubuntu:24.04 with systemd and tcpdump, where
+// dist-upgrade at once goes through).
+func (h HopSpec) firstStep() string {
+	if h.OneStep {
+		return "dist-upgrade"
+	}
+	return "upgrade"
+}
+
+// firstStepName is block 5's step as the titles say it.
+func (h HopSpec) firstStepName() string {
+	if h.OneStep {
+		return "the whole upgrade in one step, as do-release-upgrade runs it"
+	}
+	return "the minimal upgrade"
+}
+
+// sshdAliases is what the comparison of sshd's settings before and after the hop puts through, so that a setting that the new sshd only names differently is the same: OpenSSH 9.6
+// of Ubuntu 24.04 prints "permitrootlogin without-password", OpenSSH 10.2 of 26.04 its other name "prohibit-password", for the same setting (sshd -T in the image ubuntu:24.04
+// before and after the hop, 2026-11-09; the QEMU proof of the cloud image stopped on it before its restart). The texts of Debian are as they were measured.
+func (h HopSpec) sshdAliases() string {
+	if h.Distro != "Ubuntu" {
+		return ""
+	}
+	return " | sed 's/^permitrootlogin without-password$/permitrootlogin prohibit-password/'"
+}
+
+// requiredRenamed says whether the removal of a package of priority required is one of the hop's renames, its successor among the packages that the same upgrade installs.
+func (h HopSpec) requiredRenamed(name string, installed []string) bool {
+	to, ok := h.RequiredRenames[baseName(name)]
+	if !ok {
+		return false
+	}
+	if to == "" {
+		return true
+	}
+	for _, n := range installed {
+		if baseName(n) == to {
+			return true
+		}
+	}
+	return false
+}
+
+// renameCases are the lines of guard_removals' case for the hop's renames: the removal goes through when the simulation installs the successor, or dpkg has it already (a
+// repair after an interruption). Nothing for a hop that has none: the texts of the other hops are as they were.
+func (h HopSpec) renameCases() []string {
+	var lines []string
+	for _, old := range slices.Sorted(maps.Keys(h.RequiredRenames)) {
+		to := h.RequiredRenames[old]
+		if to == "" {
+			lines = append(lines, "      "+old+") ;;")
+			continue
+		}
+		lines = append(lines, fmt.Sprintf(`      %[1]s) grep -q '^Inst %[2]s ' "$1" || dpkg-query -W -f='${Status}\n' %[2]s 2> /dev/null | grep -q ' installed$' || why="required, as dpkg says, and %[2]s does not take its place" ;;`, old, to))
+	}
+	return lines
 }
 
 // PlannedHop is the hop of a box's identity, when a plan can be made for it.
@@ -164,8 +263,20 @@ func reasonText(reason string) string {
 		return "the suite is an alias that moves with the archive: name the release"
 	case "target":
 		return "the source is already at the target release or past it (if an earlier try of the upgrade by hand rewrote the sources, the folder of that plan in /var/backups, casaos-os-upgrade-<plan id>, has restore-sources.sh: run it with sh; when that folder has begun-upgrade the upgrade has begun and only goes forward)"
+	case "enabled":
+		return "a stanza that says Enabled is not read by this plan, which writes that field itself: remove the stanza, or the field"
+	case "field":
+		return "a field that apt does not read in a stanza"
+	case "field_twice":
+		return "a field is written twice in one stanza"
+	case "deb822_form":
+		return "a line is not a field of a stanza (a name, a colon, a value), nor goes on from one"
 	case "undecided":
 		return "whether this repository is the distribution's own cannot be known from the files apt keeps of it: run apt-get update first"
+	case "other_distro":
+		return "the source is the archive of another distribution than the machine's: it cannot be upgraded with the machine, remove it"
+	case "ubuntu_pro":
+		return "the machine is attached to Ubuntu Pro (esm.ubuntu.com): the pro client rewrites its sources during an upgrade, and this plan does not"
 	}
 	return "this is not a form the plan reads (" + reason + ")"
 }
@@ -183,27 +294,8 @@ var (
 // parseSourceFile reads a .list file strictly: every line is blank, a comment, or "deb|deb-src [options] URI SUITE
 // [components...]" (a comment may follow, as apt reads it); anything else is a problem, and the plan never guesses.
 func parseSourceFile(content []byte) (lines []srcLine, bad *lineProblem, badLine int) {
-	if !utf8.Valid(content) {
-		return nil, &lineProblem{CodeSourcesFormat, "encoding"}, 0
-	}
-	for i := 0; i < len(content); i++ {
-		switch b := content[i]; {
-		case b == 0:
-			return nil, &lineProblem{CodeSourcesFormat, "nul"}, lineOf(content, i)
-		case b == '\r':
-			return nil, &lineProblem{CodeSourcesFormat, "crlf"}, lineOf(content, i)
-		case b < 0x20 && b != '\n' && b != '\t', b == 0x7f:
-			return nil, &lineProblem{CodeSourcesFormat, "control"}, lineOf(content, i)
-		}
-	}
-	// the characters that are valid text and are not text: a comment may hold any UTF-8, and one that reorders what is shown
-	// (the bidirectional controls), that a terminal acts on (the C1 controls, U+0080 to U+009F) or that is not seen (the
-	// format characters: zero-width ones, the byte order mark; the line and paragraph separators) is not one that the plan
-	// shows to the owner or writes into the runbook
-	for i, r := range string(content) {
-		if r >= 0x80 && (r <= 0x9f || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp)) {
-			return nil, &lineProblem{CodeSourcesFormat, "control"}, lineOf(content, i)
-		}
+	if bad, n := textProblem(content); bad != nil {
+		return nil, bad, n
 	}
 	text := string(content)
 	raw := strings.Split(text, "\n")
@@ -233,6 +325,34 @@ func parseSourceFile(content []byte) (lines []srcLine, bad *lineProblem, badLine
 		lines = append(lines, line)
 	}
 	return lines, nil, 0
+}
+
+// textProblem is why the bytes of a file of sources, .list or .sources, are not text the plan reads, and the line: not UTF-8,
+// a NUL, a carriage return, a control character.
+func textProblem(content []byte) (*lineProblem, int) {
+	if !utf8.Valid(content) {
+		return &lineProblem{CodeSourcesFormat, "encoding"}, 0
+	}
+	for i := 0; i < len(content); i++ {
+		switch b := content[i]; {
+		case b == 0:
+			return &lineProblem{CodeSourcesFormat, "nul"}, lineOf(content, i)
+		case b == '\r':
+			return &lineProblem{CodeSourcesFormat, "crlf"}, lineOf(content, i)
+		case b < 0x20 && b != '\n' && b != '\t', b == 0x7f:
+			return &lineProblem{CodeSourcesFormat, "control"}, lineOf(content, i)
+		}
+	}
+	// the characters that are valid text and are not text: a comment may hold any UTF-8, and one that reorders what is shown
+	// (the bidirectional controls), that a terminal acts on (the C1 controls, U+0080 to U+009F) or that is not seen (the
+	// format characters: zero-width ones, the byte order mark; the line and paragraph separators) is not one that the plan
+	// shows to the owner or writes into the runbook
+	for i, r := range string(content) {
+		if r >= 0x80 && (r <= 0x9f || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp)) {
+			return &lineProblem{CodeSourcesFormat, "control"}, lineOf(content, i)
+		}
+	}
+	return nil, 0
 }
 
 func lineOf(content []byte, at int) int {
@@ -294,6 +414,22 @@ func isPrintableASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// proHost says whether an address is Ubuntu Pro's (esm.ubuntu.com). Its Release files say an origin of their own, so the decider takes it for a third party's, which the hop would
+// put aside and give back, after the hop, with the suites of the release that is left: it is refused before anyone is asked.
+func proHost(uri string) bool {
+	host := osreadiness.SourceHost(uri)
+	return host == "esm.ubuntu.com" || strings.HasSuffix(host, ".esm.ubuntu.com")
+}
+
+// otherDistroHost says whether an address is on a host of a distribution that is not the hop's: Debian's in a hop of Ubuntu, Canonical's in a hop of Debian. Such a line is
+// refused, whatever its suite says.
+func (h HopSpec) otherDistroHost(uri string) bool {
+	host := osreadiness.SourceHost(uri)
+	debian := host == "debian.org" || strings.HasSuffix(host, ".debian.org")
+	ubuntu := host == "ubuntu.com" || strings.HasSuffix(host, ".ubuntu.com")
+	return h.Distro == "Ubuntu" && debian || h.Distro == "Debian" && ubuntu
 }
 
 // distroProblem checks a line that is the distribution's own beyond the shape: what it says is words the rewrite can put
@@ -508,6 +644,8 @@ type classified struct {
 	file   osreadiness.SourceFile
 	lines  []srcLine
 	distro []bool // per line, for the repo lines
+	// deb822 is the file read as a .sources file, when it is one; lines and distro are empty then
+	deb822 *deb822File
 }
 
 // RewriteSources rewrites the sources of the box to the target release, in memory: the tree the sandbox reads (and the
@@ -520,7 +658,7 @@ func RewriteSources(ctx context.Context, hop HopSpec, files []osreadiness.Source
 		switch {
 		case f.Err != nil:
 			return nil, failf(CodeSourcesFormat, map[string]any{"file": f.Name, "reason": "unreadable"}, "%s cannot be read", f.Name)
-		case strings.HasSuffix(f.Name, ".sources"):
+		case strings.HasSuffix(f.Name, ".sources") && !hop.Deb822:
 			return nil, failf(CodeSourcesFormat, map[string]any{"file": f.Name, "reason": "deb822"}, "%s: %s", f.Name, reasonText("deb822"))
 		}
 	}
@@ -530,6 +668,14 @@ func RewriteSources(ctx context.Context, hop HopSpec, files []osreadiness.Source
 	for _, f := range files {
 		name := f.Name
 		current = append(current, hashed{path: currentPath(f), content: string(f.Content)})
+		if strings.HasSuffix(name, ".sources") {
+			d, err := readDeb822File(ctx, name, f.Content, decider, &totalRepos)
+			if err != nil {
+				return nil, err
+			}
+			cls = append(cls, classified{file: f, deb822: d})
+			continue
+		}
 		lines, bad, badLine := parseSourceFile(f.Content)
 		if bad != nil {
 			return nil, bad.failure(name, badLine)
@@ -542,6 +688,9 @@ func RewriteSources(ctx context.Context, hop HopSpec, files []osreadiness.Source
 			}
 			if totalRepos++; totalRepos > osreadiness.MaxSourceEntries {
 				return nil, &Failure{Code: CodeSourcesFormat, Detail: "more sources than a machine has", Data: map[string]any{"file": name, "line": l.n, "reason": "too_many"}}
+			}
+			if proHost(l.uri) {
+				return nil, lineProblem{CodeSourcesFormat, "ubuntu_pro"}.failure(name, l.n)
 			}
 			distro, decided, err := decider.Suite(ctx, l.uri, l.suite)
 			if err != nil {
@@ -560,6 +709,23 @@ func RewriteSources(ctx context.Context, hop HopSpec, files []osreadiness.Source
 	distroKept := 0
 	for _, c := range cls {
 		name := c.file.Name
+		if c.deb822 != nil {
+			content, paused, changes, err := hop.rewriteDeb822(name, c.deb822, out, &distroKept)
+			switch {
+			case err != nil:
+				return nil, err
+			case paused:
+				out.Files = append(out.Files, FileChange{File: name, Action: ActionPaused, Lines: changes})
+				continue
+			}
+			action := ActionUnchanged
+			if len(changes) > 0 {
+				action = ActionRewritten
+			}
+			out.Files = append(out.Files, FileChange{File: name, Action: action, Lines: changes})
+			out.Tree = append(out.Tree, TreeFile{Path: "parts/" + name, Content: content})
+			continue
+		}
 		changes := []LineChange{}
 		repos, distros := 0, 0
 		allDocker := true
@@ -608,6 +774,9 @@ func RewriteSources(ctx context.Context, hop HopSpec, files []osreadiness.Source
 				}
 				out.Paused = append(out.Paused, Paused{File: name, Line: l.n, Hosts: lineHosts, Docker: osreadiness.SourceHost(l.uri) == osreadiness.DockerHost})
 			default:
+				if hop.otherDistroHost(l.uri) {
+					return nil, lineProblem{CodeSourcesFormat, "other_distro"}.failure(name, l.n)
+				}
 				if p := distroProblem(&c.lines[i]); p != nil {
 					return nil, p.failure(name, l.n)
 				}
@@ -699,6 +868,12 @@ func joinLines(lines []srcLine) string {
 // of the target, is the rewrite's own bug, and nothing is returned. A refresh has no target: its lines are of the release that is left.
 func checkTree(hop HopSpec, tree []TreeFile) error {
 	for _, f := range tree {
+		if strings.HasSuffix(f.Path, ".sources") {
+			if err := checkDeb822Tree(hop, f); err != nil {
+				return err
+			}
+			continue
+		}
 		lines, bad, n := parseSourceFile([]byte(f.Content))
 		if bad != nil {
 			return failf(CodeInternal, nil, "the tree's %s line %d is not read by the strict parser (%s)", f.Path, n, bad.reason)

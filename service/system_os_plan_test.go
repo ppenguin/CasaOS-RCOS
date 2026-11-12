@@ -1088,7 +1088,7 @@ func TestARunbookThatCannotBeWrittenIsRefusedWithItsReason(t *testing.T) {
 		}, OSPlanNoPlan, "unavailable"},
 		{"a hop that has no runbook", func(b *planBox) *osplan.Plan {
 			p := aPlan(b.now(), osplan.VerdictOK)
-			p.Hop = "debian-12-13"
+			p.Hop = "debian-13-14"
 			return p
 		}, OSPlanNoPlan, "unavailable"},
 	} {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/ReCasaOS/CasaOS-Common/utils/jwt"
 	"github.com/ReCasaOS/CasaOS/model"
+	"github.com/ReCasaOS/CasaOS/pkg/fleet"
 	"github.com/ReCasaOS/CasaOS/service"
 	"github.com/labstack/echo/v4"
 )
@@ -74,10 +75,63 @@ func TestTheV1TokenInTheQueryIsTakenOnlyOnAGetAndNeverTheRefreshToken(t *testing
 		{"websocket upgrade, the refresh token in the query", http.MethodGet, status + "?token=" + refresh, "", "", true, http.StatusUnauthorized},
 		{"POST /v1/sys/update, the refresh token in the header", http.MethodPost, update, "", refresh, false, http.StatusUnauthorized},
 		{"PUT /v1/sys/autoupdate, the refresh token in the header", http.MethodPut, autoupdate, "{", refresh, false, http.StatusUnauthorized},
+		// The fleet: a GET relay takes the token in the query (an image or a
+		// download would); a PUT that joins a fleet wants it in the header, and
+		// never the refresh token. Role off, so a request that passes the token
+		// check reaches the handler and gets 404, never 401.
+		{"GET relay, the access token in the query", http.MethodGet, "/v1/fleet/boxes/x/relay/v1/sys/os?token=" + access, "", "", false, http.StatusNotFound},
+		{"PUT /v1/fleet/member, the access token in the query", http.MethodPut, "/v1/fleet/member?token=" + access, "{}", "", false, http.StatusUnauthorized},
+		{"PUT /v1/fleet/member, the access token in the header", http.MethodPut, "/v1/fleet/member", "{}", access, false, http.StatusBadRequest},
+		{"PUT /v1/fleet/member, the refresh token in the header", http.MethodPut, "/v1/fleet/member", "{}", refresh, false, http.StatusUnauthorized},
 	} {
 		if got := callWith(e, c); got != c.want {
 			t.Errorf("%s: status = %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// The routes that put this box in a relay's private network, or move it to
+// another, want the access token in the header like the other fleet PUTs. Past
+// the token, each refuses its body (400) before anything is touched.
+func TestRelayRoutesNeedHeaderToken(t *testing.T) {
+	system := &fakeUpdateSystem{}
+	access, refresh, _ := theTokensOfTheTests(t, system)
+	service.MyService = tokenRepository{fakeUpdateRepository{system: system}}
+	original := fleet.Default
+	fleet.Default = fleet.New(t.TempDir())
+	t.Cleanup(func() { fleet.Default = original })
+	e := InitV1Router()
+
+	const master, relay, both = "/v1/fleet/master", "/v1/fleet/relay", `{"enabled":true,"address":"https://m.example","relay":"https://relay.example"}`
+	for _, c := range []tokenCase{
+		{"PUT /v1/fleet/master, the access token in the query", http.MethodPut, master + "?token=" + access, both, "", false, http.StatusUnauthorized},
+		{"PUT /v1/fleet/master, the access token in the header", http.MethodPut, master, both, access, false, http.StatusBadRequest},
+		{"PUT /v1/fleet/master, the refresh token in the header", http.MethodPut, master, both, refresh, false, http.StatusUnauthorized},
+		{"PUT /v1/fleet/relay, the access token in the query", http.MethodPut, relay + "?token=" + access, "{}", "", false, http.StatusUnauthorized},
+		{"PUT /v1/fleet/relay, the access token in the header", http.MethodPut, relay, "{}", access, false, http.StatusBadRequest},
+		{"PUT /v1/fleet/relay, the refresh token in the header", http.MethodPut, relay, "{}", refresh, false, http.StatusUnauthorized},
+	} {
+		if got := callWith(e, c); got != c.want {
+			t.Errorf("%s: status = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// A service of the box reaches a GET relay with the secret of the boot, from
+// loopback: the JWT group lets it through, so the handler runs (404, role off)
+// rather than 401.
+func TestFleetRelayTakesTheInternalSecretFromLoopback(t *testing.T) {
+	system := &fakeUpdateSystem{}
+	_, _, secret := theTokensOfTheTests(t, system)
+	service.MyService = tokenRepository{fakeUpdateRepository{system: system}}
+	e := InitV1Router()
+	request := httptest.NewRequest(http.MethodGet, "/v1/fleet/boxes/x/relay/v1/sys/os", nil)
+	request.Header.Set(echo.HeaderAuthorization, secret)
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	e.ServeHTTP(recorder, request)
+	if recorder.Code == http.StatusUnauthorized {
+		t.Fatalf("an internal request was refused: %d", recorder.Code)
 	}
 }
 

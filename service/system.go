@@ -10,6 +10,7 @@ import (
 	"os"
 	osExec "os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -24,6 +25,8 @@ import (
 	"github.com/ReCasaOS/CasaOS/common"
 	"github.com/ReCasaOS/CasaOS/model"
 	"github.com/ReCasaOS/CasaOS/pkg/config"
+	"github.com/ReCasaOS/CasaOS/pkg/cpufreq"
+	"github.com/ReCasaOS/CasaOS/pkg/hwmon"
 	"github.com/ReCasaOS/CasaOS/pkg/osplan"
 	"github.com/ReCasaOS/CasaOS/pkg/osreadiness"
 	"github.com/ReCasaOS/CasaOS/pkg/ossupport"
@@ -42,6 +45,8 @@ import (
 
 type SystemService interface {
 	UpdateSystemVersion(version string) error
+	// UpdateSystemRelease is UpdateSystemVersion for the release tagged tag, not the latest.
+	UpdateSystemRelease(tag string) error
 	// MaintenanceBusy says whether a package update, an update of Docker or a package
 	// manager is changing the box now.
 	MaintenanceBusy() bool
@@ -137,6 +142,7 @@ type SystemService interface {
 	MkdirAll(path string) (int, error)
 	GetCPUTemperature() int
 	GetCPUPower() map[string]string
+	GetCPUFrequency() int
 	GetMacAddress() (string, error)
 	SystemReboot() error
 	SystemShutdown() error
@@ -456,6 +462,27 @@ func (c *systemService) GetNet(physics bool) []string {
 }
 
 func (s *systemService) UpdateSystemVersion(version string) error {
+	return s.updateSystem(version, resolveUpdateInstallerURL())
+}
+
+func (s *systemService) UpdateSystemRelease(tag string) error {
+	return s.updateSystem(tag, resolveReleaseInstallerURL(tag))
+}
+
+// releaseTag is a release's tag as the fork cuts them; it goes into a URL.
+var releaseTag = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
+
+// resolveReleaseInstallerURL is the install.sh the release tagged tag carries, unless
+// config or the install check names an installer of their own.
+func resolveReleaseInstallerURL(tag string) string {
+	url := resolveUpdateInstallerURL()
+	if url == common.FORK_UPDATE_URL && releaseTag.MatchString(tag) {
+		return common.FORK_RELEASE_BASE + tag + "/install.sh"
+	}
+	return url
+}
+
+func (s *systemService) updateSystem(version, installerURL string) error {
 	if reason, busy := s.systemPackageUpdater().maintenanceBusy(context.Background(), common.UPDATE_UNIT+".service"); busy {
 		return fmt.Errorf("%w: %s", ErrSystemMaintenanceBusy, reason)
 	}
@@ -467,7 +494,7 @@ func (s *systemService) UpdateSystemVersion(version string) error {
 		return fmt.Errorf("prepare update log: %w", err)
 	}
 
-	return startDetachedUpdate(resolveUpdateInstallerURL(), logPath, version)
+	return startDetachedUpdate(installerURL, logPath, version)
 }
 
 func startDetachedUpdate(installerURL, logPath, version string) error {
@@ -618,8 +645,10 @@ func GetCPUThermalZone() string {
 
 func (s *systemService) GetCPUTemperature() int {
 	outPut := ""
-	path := GetCPUThermalZone()
-	if len(path) > 0 {
+	// the processor's own chip first, found by its name: hwmon0 is the charger on a laptop, and a box with no thermal zone has nothing else
+	if raw, ok := hwmon.CPUTemperature("/sys/class/hwmon"); ok {
+		outPut = strconv.Itoa(raw)
+	} else if path := GetCPUThermalZone(); len(path) > 0 {
 		outPut = string(file.ReadFullFile(path + "/temp"))
 	} else {
 		outPut = string(file.ReadFullFile("/sys/class/hwmon/hwmon0/temp1_input"))
@@ -634,6 +663,12 @@ func (s *systemService) GetCPUTemperature() int {
 		celsius = celsius / 1000
 	}
 	return celsius
+}
+
+// GetCPUFrequency is the mean current frequency of the cores in MHz, 0 when the box reports none.
+func (s *systemService) GetCPUFrequency() int {
+	mhz, _ := cpufreq.Average("/sys/devices/system/cpu")
+	return mhz
 }
 
 func (s *systemService) GetCPUPower() map[string]string {

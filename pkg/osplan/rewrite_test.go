@@ -16,7 +16,7 @@ import (
 	"github.com/ReCasaOS/CasaOS/pkg/osreadiness"
 )
 
-var bullseyeToBookworm = HopSpec{ID: osreadiness.HopDebian11to12, From: "bullseye", To: "bookworm", Later: []string{"trixie", "forky"}, Firmware: true}
+var bullseyeToBookworm = HopSpec{ID: osreadiness.HopDebian11to12, Distro: "Debian", From: "bullseye", To: "bookworm", FromVersion: "11", ToVersion: "12", Later: []string{"trixie", "forky"}, Firmware: true}
 
 // fakeDecider says what the report would say of the hosts it names: official hosts are the distribution's, a host that
 // is in mirrors has a Release file that says so, the others are third parties, and a host in undecided is one it cannot
@@ -37,6 +37,9 @@ func (d *fakeDecider) Suite(_ context.Context, uri, suite string) (bool, bool, e
 	case osreadiness.SourceIsLocal(uri):
 		return false, true, nil
 	case host == "debian.org" || strings.HasSuffix(host, ".debian.org"):
+		return true, true, nil
+	case host == "archive.ubuntu.com" || strings.HasSuffix(host, ".archive.ubuntu.com") || host == "security.ubuntu.com":
+		// as the real decider: by their names (esm.ubuntu.com is not one, and its Release file says UbuntuESMApps)
 		return true, true, nil
 	case slices.Contains(d.mirrors, host):
 		return true, true, nil

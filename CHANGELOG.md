@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fleet.** A box can be the master of your other boxes. Each one joins with a code from the master and keeps an outbound WebSocket to `/v1/fleet/tunnel`: no port opens on a member, Tailscale or not. A member checks the master's certificate the usual way, or, when that fails, against the fingerprint in the code (the default self-signed certificate).
+  - the master relays a fixed table of each box's own routes and nothing else, checked on both sides: version, OS, utilization, modules, health, packages and their update, the ReCasaOS update, the apps (list, start, stop, restart, update, image check) and the virtual machines (list, start, shutdown, reboot, force-off), and the backup routes the master needs (runs, schedules and running them now, verifications and their schedule, a restic destination's status and check); everything else is 403
+  - the member runs them through its own gateway with the identity of its services, so the box's own refusals (an update during a backup, Docker left out) still hold
+  - `GET /v1/fleet`, `GET /v1/fleet/backups`, `PUT /v1/fleet/master`, `POST|PATCH|DELETE /v1/fleet/boxes`, `POST /v1/fleet/boxes/{id}/code`, `/v1/fleet/boxes/{id}/relay/*`, `PUT|DELETE /v1/fleet/member`
+  - a new alert category, `fleet`: one alert when a box has not reached the master for ten minutes, resolved when it is back
+  - the master also reads its boxes' backups every five minutes, serves what it read on the Fleet page and sends the Fleet alerts for them; to hear of a problem once, set no channel on the member boxes
+  - state in `/var/lib/casaos/fleet/master.json` (box keys only hashed) and `member.json`, root, 0600
+  - a master whose gateway serves no certificate (HTTPS off, or TLS ended by a proxy) adds boxes anyway: their code carries no pin and the chain check decides
+- **A local process stack for development.** `./dev/stack.sh` starts the Gateway and the sibling services as the developer, on `127.0.0.1:8081`, with config and state under `.dev-runtime/`. Compose talks to a record-keeping Engine (`dev/fakedocker`) on a unix socket in that tree, not to `/var/run/docker.sock`. Storage lists two fixture disks. The file API is confined to `.dev-runtime/data`. This is not `install.sh`. Commands and limits are in `dev/README.md`.
+- **`GET /v1/file/roots`** returns the directories `[file] ManagementRoots` names, so the dashboard Files panel opens there instead of `/DATA`.
 - **`[file] ManagementRoots` confines the file API** (opt-in; empty = unchanged). Comma-separated directories, e.g. `/DATA,/media`.
   - every file route: path spelled once (`..`, `//` refused), resolved below its root with `openat2(RESOLVE_BENEATH)`: no `..` or symlink out; 403 otherwise, reason in `data`
   - root opened on every check: a disk mounted later is the one checked; a root missing (not mounted yet) → its paths 403 until it is; an unusable setting → every path 403 (no exit, the dashboard starts)
@@ -18,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - first install, "apps on /": the step that creates `/var/lib/docker` through the file API gets 403 unless that path is below a root
   - check before the operation (path-based), not descriptor-relative operations
   - ported from EdmundFu-233/ReCasaOS `pkg/filesecurity` (Apache-2.0)
+
+### Fixed
+
+- **`GET /v1/sys/proxy` no longer sends the internal secret.** The "add a link" panel asks it whether an address answers. It fetched the address with CasaOS-Common's HTTP helpers, which add the internal secret to any request aimed at loopback, and relayed the whole response: a signed-in account could read a service's private routes as the box itself (`/v1/sys/proxy?url=http://127.0.0.1:<port>/…`).
+  - it now sends a plain request, accepts `http` and `https` addresses only (400 otherwise), and gives back only the status the address answered with, not its body
 
 ## [0.4.54] - 2026-09-15
 

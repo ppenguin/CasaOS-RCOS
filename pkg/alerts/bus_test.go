@@ -48,6 +48,10 @@ func TestEachEventsAlert(t *testing.T) {
 			"backup:error", map[string]string{"backup:destination": "nas", "backup:kind": "backup"},
 			alert{"backup::nas", Backups, `The backup to "nas" failed.`}, false,
 		},
+		{
+			"backup:check-error", map[string]string{"backup:destination": "nas", "message": "restic exited with 1: pack 1a2b: does not exist\nmore"},
+			alert{"backup-check:nas", Backups, `The restic repository at "nas" does not check out: restic exited with 1: pack 1a2b: does not exist.`}, false,
+		},
 		{"app:install-error", with(immich, "message", "SECRET=hunter2 is invalid"), alert{"app:immich:install", Apps, "Installing Immich failed."}, false},
 		{"app:update-error", with(immich), alert{"app:immich:update", Apps, "Updating Immich failed."}, false},
 		{"app:start-error", with(immich), alert{"app:immich:start", Apps, "Starting Immich failed."}, false},
@@ -420,4 +424,45 @@ func sorted(names []string) []string {
 	names = slices.Clone(names)
 	slices.Sort(names)
 	return names
+}
+
+func TestLogsLink(t *testing.T) {
+	at := time.Date(2026, 9, 25, 6, 0, 0, 0, time.UTC)
+	for _, c := range []struct{ master, box, address, app, want string }{
+		{"https://m.example:8443/", "b1", "http://192.168.1.20", "immich", "https://m.example:8443/#/logs?box=b1&app=immich&at=2026-09-25T06:00:00Z"},
+		{"", "", "http://192.168.1.20", "immich", "http://192.168.1.20/#/logs?app=immich&at=2026-09-25T06:00:00Z"},
+		{"", "", "", "immich", ""},
+		{"", "", "http://192.168.1.20", "", ""},
+		{"", "", "http://192.168.1.20", "my app&x", "http://192.168.1.20/#/logs?app=my+app%26x&at=2026-09-25T06:00:00Z"},
+	} {
+		if got := logsLink(c.master, c.box, c.address, c.app, at); got != c.want {
+			t.Errorf("%+v: %q", c, got)
+		}
+	}
+}
+
+func TestAppEventsReachTheHook(t *testing.T) {
+	h, o, _ := newHub(t)
+	h.Muted = func() bool { return true }
+	immich := map[string]string{"app:name": "immich"}
+	h.onEvent("app:install-end", immich) // no hook yet: nothing happens
+	var got []string
+	h.OnAppEvent = func(name string, p map[string]string) { got = append(got, name+" "+p["app:name"]) }
+	for _, name := range []string{"app:install-end", "app:uninstall-end", "app:apply-changes-end", "app:install-error", "app:container-died"} {
+		h.onEvent(name, immich)
+	}
+	h.sending.Wait()
+	want := []string{"app:install-end immich", "app:uninstall-end immich", "app:apply-changes-end immich"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("hook heard %q, want %q", got, want)
+	}
+	// the alerts' own handling is unchanged: the install error only (the container event is muted)
+	if texts := o.texts(phone); len(texts) != 1 || !strings.Contains(texts[0], "Installing immich failed") {
+		t.Fatalf("sent %q", texts)
+	}
+	for _, name := range []string{"app:install-end", "app:uninstall-end", "app:apply-changes-end"} {
+		if !slices.Contains(busEvents(), name) {
+			t.Errorf("busEvents() lacks %s", name)
+		}
+	}
 }

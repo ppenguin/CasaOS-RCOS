@@ -58,9 +58,13 @@ var recheckRegistered = time.Minute
 // Docker update stirs up, and so the only ones Hub.Muted silences.
 var containerEvents = []string{"app:container-died", "app:container-unhealthy", "app:container-restarting", "app:container-healthy"}
 
+// appEvents are passed to Hub.OnAppEvent; they raise no alert.
+var appEvents = []string{"app:install-end", "app:uninstall-end", "app:apply-changes-end"}
+
 // busEvents are the events of AppManagement this package subscribes to.
 func busEvents() []string {
-	names := append([]string{"backup:error"}, containerEvents...)
+	names := append([]string{"backup:error", "backup:check-error"}, containerEvents...)
+	names = append(names, appEvents...)
 	names = append(names, resourceEvents...)
 	for operation := range operations {
 		names = append(names, "app:"+operation+"-error")
@@ -189,6 +193,9 @@ func registered(ctx context.Context, address, runtimePath string, f feed) ([]str
 // dropped, the Hub's memory of what it sent is not touched, so that no "resolved" follows an
 // alert that was never sent.
 func (h *Hub) onEvent(name string, properties map[string]string) {
+	if h.OnAppEvent != nil && slices.Contains(appEvents, name) {
+		h.OnAppEvent(name, properties)
+	}
 	if (slices.Contains(containerEvents, name) || isMutedResource(name, properties)) && h.Muted() {
 		return
 	}
@@ -201,9 +208,30 @@ func (h *Hub) onEvent(name string, properties map[string]string) {
 	case !ok:
 	case resolved:
 		h.resolve(a)
+	case slices.Contains(logsEvents, name):
+		m, b, _ := h.MasterLink()
+		h.raiseWith(a, logsLink(m, b, h.Address(), properties["app:name"], h.Now()))
 	default:
 		h.raise(a)
 	}
+}
+
+// logsEvents are the alerts that end with a link to the app's logs.
+var logsEvents = []string{"app:container-died", "app:container-unhealthy", "app:container-restarting"}
+
+// logsLink opens the Logs page on app at the minute of the event: on the fleet master when the box
+// is a member, else on the box's own dashboard, else "".
+func logsLink(masterURL, boxID, address, app string, at time.Time) string {
+	query := "app=" + url.QueryEscape(app) + "&at=" + at.UTC().Format(time.RFC3339)
+	switch {
+	case app == "":
+		return ""
+	case masterURL != "":
+		return strings.TrimSuffix(masterURL, "/") + "/#/logs?box=" + url.QueryEscape(boxID) + "&" + query
+	case address != "":
+		return strings.TrimSuffix(address, "/") + "/#/logs?" + query
+	}
+	return ""
 }
 
 // fromEvent is the alert of one of AppManagement's events, and whether the
@@ -229,6 +257,14 @@ func fromEvent(name string, p map[string]string) (a alert, resolved, ok bool) {
 			sentence += ": " + reason
 		}
 		return alert{key: "backup:" + p["app:name"] + ":" + p["backup:destination"], category: Backups, sentence: sentence + "."}, false, true
+	case "backup:check-error":
+		// a repository kept with restic that does not check out: no app, and not a backup
+		// that failed but the copies that are already there
+		sentence := fmt.Sprintf("The restic repository at %q does not check out", p["backup:destination"])
+		if reason := plain(p["message"]); reason != "" {
+			sentence += ": " + reason
+		}
+		return alert{key: "backup-check:" + p["backup:destination"], category: Backups, sentence: sentence + "."}, false, true
 	case "app:container-died":
 		sentence := app + " stopped unexpectedly" + container
 		if code := p["docker:container:exit-code"]; code != "" {

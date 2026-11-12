@@ -22,6 +22,7 @@
 // the owner is told once for each state of each release, from a look every day: the
 // last one told is kept in os-support.notified, written once a message has gone out,
 // so that a state is looked at again, every day, until a channel has taken it.
+// A Raspbian 32-bit box, which has no state, is told once that Docker 28 is its last.
 package alerts
 
 import (
@@ -62,9 +63,10 @@ const (
 	Updates   = "updates"
 	Apps      = "apps"
 	Resources = "resources"
+	Fleet     = "fleet"
 )
 
-var categories = []string{Backups, Disks, Updates, Apps, Resources}
+var categories = []string{Backups, Disks, Updates, Apps, Resources, Fleet}
 
 // alert is one condition: its key is what dedupe and resolution go by, its
 // sentence says what and where, and never anything more sensitive than an
@@ -96,6 +98,8 @@ type Hub struct {
 	Hostname    func() (string, error)
 	// Address is the dashboard's address, or "" when the core does not know it.
 	Address func() string
+	// MasterLink is the fleet master's address and this box's id there when the box is a member.
+	MasterLink func() (masterURL, boxID string, ok bool)
 	// Send delivers one message to one channel URL.
 	Send func(rawURL, title, message string) error
 	// Latest is the newest release as the update button reads it, Current the
@@ -115,6 +119,9 @@ type Hub struct {
 	OSSupport func() ossupport.Report
 	// OSUpgradeRetries are the waits before a notice of the upgrade of the operating system that no channel took is sent again; a test shortens them.
 	OSUpgradeRetries []time.Duration
+	// OnAppEvent, when set, hears app:install-end, app:uninstall-end and app:apply-changes-end, muted or
+	// not (the sharing service follows the apps with it). It runs on the bus's goroutine: it returns at once.
+	OnAppEvent func(name string, properties map[string]string)
 
 	modifying   sync.Mutex // serialises Update's read-modify-writes of alerts.json
 	mu          sync.Mutex // guards sent and lastFailure
@@ -150,6 +157,7 @@ func New(root string) *Hub {
 		Now:              time.Now,
 		Hostname:         os.Hostname,
 		Address:          func() string { return "" },
+		MasterLink:       func() (string, string, bool) { return "", "", false },
 		Send:             send,
 		Latest:           func() string { return "" },
 		Current:          version.CurrentVersion,
@@ -191,14 +199,20 @@ func (h *Hub) Run(ctx context.Context) {
 // the next message says how often it came back. It reports whether a is now
 // on record as sent.
 func (h *Hub) raise(a alert) bool {
-	return h.raiseAs(a, false)
+	return h.raiseWith(a, "")
+}
+
+// raiseWith is raise, and a non-empty link replaces the dashboard's address as the message's last line.
+// A repeat counted within six hours keeps the link of the first send.
+func (h *Hub) raiseWith(a alert, link string) bool {
+	return h.raiseAs(a, false, link)
 }
 
 // raiseAs is raise, and with wait it sends now and waits for the channels, and then
 // reports whether one of them took the message: when none did, a is not on record, so
 // that the caller can try again. A caller that tells a condition once, for good, needs
 // that; the others fire and forget.
-func (h *Hub) raiseAs(a alert, wait bool) bool {
+func (h *Hub) raiseAs(a alert, wait bool, link string) bool {
 	c := h.load()
 	if len(c.Channels) == 0 || !c.Categories[a.category] {
 		return false
@@ -225,10 +239,10 @@ func (h *Hub) raiseAs(a alert, wait bool) bool {
 		sentence += fmt.Sprintf(" It happened %d times since %s.", previous.repeats+1, previous.at.Format("15:04"))
 	}
 	if !wait {
-		h.deliver(c.Channels, a.category, sentence)
+		h.deliver(c.Channels, a.category, sentence, link)
 		return true
 	}
-	if h.deliverAll(c.Channels, a.category, sentence) {
+	if h.deliverAll(c.Channels, a.category, sentence, link) {
 		return true
 	}
 	h.mu.Lock()
@@ -255,24 +269,24 @@ func (h *Hub) resolve(a alert) {
 		return
 	}
 	if c := h.load(); len(c.Channels) > 0 && c.Categories[a.category] {
-		h.deliver(c.Channels, a.category, a.sentence)
+		h.deliver(c.Channels, a.category, a.sentence, "")
 	}
 }
 
 // deliver sends a message to every channel, each on its own, and returns at
 // once: a source never waits for a channel.
-func (h *Hub) deliver(channels []Channel, category, sentence string) {
+func (h *Hub) deliver(channels []Channel, category, sentence, link string) {
 	h.sending.Add(1)
 	go func() {
 		defer h.sending.Done()
-		h.deliverAll(channels, category, sentence)
+		h.deliverAll(channels, category, sentence, link)
 	}()
 }
 
 // deliverAll sends a message to every channel, each on its own, and waits for them: it
 // reports whether at least one took it.
-func (h *Hub) deliverAll(channels []Channel, category, sentence string) bool {
-	title, message := h.compose(category, sentence)
+func (h *Hub) deliverAll(channels []Channel, category, sentence, link string) bool {
+	title, message := h.compose(category, sentence, link)
 	var each sync.WaitGroup
 	var accepted atomic.Bool
 	for _, channel := range channels {
@@ -289,14 +303,16 @@ func (h *Hub) deliverAll(channels []Channel, category, sentence string) bool {
 }
 
 // compose is the title, "ReCasaOS · <hostname> · <category>", and the message:
-// the sentence, then the dashboard's address when the core knows it.
-func (h *Hub) compose(category, sentence string) (title, message string) {
+// the sentence, then the link when there is one, else the dashboard's address when the core knows it.
+func (h *Hub) compose(category, sentence, link string) (title, message string) {
 	hostname, err := h.Hostname()
 	if err != nil || hostname == "" {
 		hostname = "unknown host"
 	}
 	message = sentence
-	if address := h.Address(); address != "" {
+	if link != "" {
+		message += "\n" + link
+	} else if address := h.Address(); address != "" {
 		message += "\n" + address
 	}
 	return "ReCasaOS · " + hostname + " · " + category, message
